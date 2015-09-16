@@ -161,7 +161,7 @@ sub run {
         $params{dynamic_lib} = {
             # OTHERLDFLAGS => qq|-Wl,-rpath,$ENV{ORIGIN}/../../../../../../../../lib/|,
             # OTHERLDFLAGS => q|-Wl,-rpath,\$$\ORIGIN/../../../../../../../../lib/|
-            OTHERLDFLAGS => qq|-Wl,-rpath,$opt{dynamic_lib}|;
+            OTHERLDFLAGS => qq|-Wl,-rpath,$opt{dynamic_lib}|,
         },
 
     }
