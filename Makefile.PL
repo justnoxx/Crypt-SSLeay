@@ -34,6 +34,7 @@ sub run {
         \%opt,
         'incpath=s',
         'libpath=s',
+        'dynamic_lib=s',
         'openssl-prefix=s',
         'live-tests!',
         'static',
@@ -149,12 +150,21 @@ sub run {
                 'assertlib*',
             ),
         },
+        # ../../work/ssl/lib/libcrypto.so.1.0.0 
 
         LICENSE => 'artistic_2',
 
         MIN_PERL_VERSION => 5.006,
     );
 
+    if ($opt{dynamic_lib}) {
+        $params{dynamic_lib} = {
+            # OTHERLDFLAGS => qq|-Wl,-rpath,$ENV{ORIGIN}/../../../../../../../../lib/|,
+            # OTHERLDFLAGS => q|-Wl,-rpath,\$$\ORIGIN/../../../../../../../../lib/|
+            OTHERLDFLAGS => qq|-Wl,-rpath,$opt{dynamic_lib}|;
+        },
+
+    }
     $mm_version = eval $mm_version;
 
     die "EXTRA_META is deprecated" if exists $params{EXTRA_META};
