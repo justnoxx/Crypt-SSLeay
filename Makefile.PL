@@ -2,14 +2,16 @@ use 5.006;
 use strict;
 use warnings;
 
-use Config;
 use ExtUtils::CBuilder;
 use ExtUtils::MakeMaker;
 use Getopt::Long qw( GetOptionsFromArray );
 use Path::Class;
+use Try::Tiny;
+
 use inc::IO::Interactive::Tiny;
 
-run(\@ARGV, [qw{ssl crypto ssl32 ssleay32 eay32 libeay32 z}]);
+caller
+    or run(\@ARGV, [qw{ssl crypto ssl32 ssleay32 eay32 libeay32 z}]);
 
 sub run {
     my $argv = shift;
@@ -35,7 +37,6 @@ sub run {
         'incpath=s',
         'libpath=s',
         'dynamic_lib=s',
-        'openssl-prefix=s',
         'live-tests!',
         'static',
         'verbose!',
@@ -45,28 +46,41 @@ sub run {
         $opt{verbose} = 1;
     }
 
-    $opt{incpath} = select_first_realpath(
-        [$opt{incpath}],
-        [$ENV{OPENSSL_INCLUDE}],
-        [$ENV{OPENSSL_PREFIX}, 'include'],
-    );
+    if (
+        (not exists $opt{incpath}) and
+        (exists $ENV{OPENSSL_INCLUDE})
+    )
+    {
+        $opt{incpath} = $ENV{OPENSSL_INCLUDE};
+    }
 
-    $opt{libpath} = select_first_realpath(
-        [$opt{libpath}],
-        [$ENV{OPENSSL_LIB}],
-        [$ENV{OPENSSL_PREFIX}, 'lib'],
-    );
+    if (
+        (not exists $opt{libpath}) and
+        (exists $ENV{OPENSSL_LIB})
+    )
+    {
+        $opt{libpath} = $ENV{OPENSSL_LIB};
+    }
+
+    # Address RT #78848 and RT #88269
+
+    for my $arg (qw(incpath libpath)) {
+        next unless exists $opt{$arg};
+        my $path = $opt{$arg};
+
+        try {
+            $opt{$arg} = file($path)->absolute->resolve
+        }
+        catch {
+            print "Failed to resolve '$arg=$path': $_\n";
+            exit 0;
+        };
+    }
+
+    $libs = filter_libs(\%opt, $libs);
 
     unless ($ENV{AUTOMATED_TESTING}) {
         show_do_you_need_crypt_ssleay();
-    }
-
-    if ($Config{cc} ne 'cl') {
-        # Problems with recent versions of Devel::CheckLib on Windows.
-        # I do not know if they are due to the library, the OS, the
-        # toolchain, or my specific configuration, so disable this when
-        # using the MS compiler for now.
-        $libs = filter_libs(\%opt, $libs);
     }
 
     my $my_openssl_version_cmd = eval {
@@ -80,9 +94,12 @@ sub run {
 
     show_cmd_output($my_openssl_version_cmd);
 
+    # No live tests by default
     if ($ENV{PERL_MM_USE_DEFAULT}) {
         $opt{'live-tests'} = 0;
     }
+    # otherwise, only check other ways of requesting live tests if command
+    # line option was not given
     elsif (not exists $opt{'live-tests'}) {
         if (exists $ENV{CRYPT_SSLEAY_LIVE_TEST_WANTED}) {
             $opt{'live-tests'} = $ENV{CRYPT_SSLEAY_LIVE_TEST_WANTED};
@@ -126,18 +143,18 @@ sub run {
         ($opt{static} ? (LINK_TYPE => 'static') : ()),
 
         TEST_REQUIRES => {
-            'Test::More' => '0.19',
             'Try::Tiny' => '0.19',
+            'Test::More' => '0.19',
         },
 
         CONFIGURE_REQUIRES => {
             'ExtUtils::CBuilder' => '0.280205',
             'Getopt::Long' => 0,
             'Path::Class' => '0.26',
+            'Try::Tiny' => '0.19',
         },
 
         PREREQ_PM => {
-            'Bytes::Random::Secure' => '0.28',
             'LWP::Protocol::https' => '6.02',
             'MIME::Base64' => 0, # for Net::SSL
         },
@@ -150,7 +167,6 @@ sub run {
                 'assertlib*',
             ),
         },
-        # ../../work/ssl/lib/libcrypto.so.1.0.0 
 
         LICENSE => 'artistic_2',
 
@@ -159,12 +175,10 @@ sub run {
 
     if ($opt{dynamic_lib}) {
         $params{dynamic_lib} = {
-            # OTHERLDFLAGS => qq|-Wl,-rpath,$ENV{ORIGIN}/../../../../../../../../lib/|,
-            # OTHERLDFLAGS => q|-Wl,-rpath,\$$\ORIGIN/../../../../../../../../lib/|
             OTHERLDFLAGS => qq|-Wl,-rpath,$opt{dynamic_lib}|,
         },
-
     }
+
     $mm_version = eval $mm_version;
 
     die "EXTRA_META is deprecated" if exists $params{EXTRA_META};
@@ -272,24 +286,21 @@ sub build_openssl_version {
     return file($executable)->absolute->resolve;
 }
 
-sub select_first_realpath {
-    my ($ret) = map eval {dir(@$_)->absolute->resolve}, @_;
-    $ret;
-}
-
 sub filter_libs {
     my $opt = shift;
     my $libs = shift;
 
     return $libs unless eval {
         require Devel::CheckLib;
+        Devel::CheckLib->import;
         1;
     };
 
     my @found;
+
     for my $lib (@$libs) {
        eval {
-           Devel::CheckLib::assert_lib(
+           assert_lib(
                 debug => ($opt->{verbose} ? 1 : 0),
                 lib => $lib,
                 header => 'openssl/ssl.h',

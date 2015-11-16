@@ -2,23 +2,19 @@ package Net::SSL;
 
 use strict;
 use MIME::Base64;
-use Socket qw(:DEFAULT :crlf);
-use Carp qw( croak );
+use Socket;
+use Carp;
 
-use vars qw(@ISA $VERSION);
-$VERSION = '2.88';
+use vars qw(@ISA $VERSION $NEW_ARGS);
+$VERSION = '2.86';
 $VERSION = eval $VERSION;
 
-BEGIN {
-    if (eval { require IO::Socket::IP; 1 }) {
-        @ISA = qw( IO::Socket::IP );
-    }
-    else {
-        require IO::Socket;
-        @ISA = qw( IO::Socket::INET );
-    }
-}
+require IO::Socket;
+@ISA=qw(IO::Socket::INET);
 
+my %REAL; # private to this package only
+my $DEFAULT_VERSION = '23';
+my $CRLF = "\015\012";
 my $SEND_USERAGENT_TO_PROXY = 0;
 
 require Crypt::SSLeay;
@@ -34,45 +30,57 @@ sub _alarm_set {
 }
 
 sub new {
-    my $class = shift;
-    $class->SUPER::new(@_);
+    my($class, %arg) = @_;
+    local $NEW_ARGS = \%arg;
+    $class->SUPER::new(%arg);
 }
 
 sub DESTROY {
     my $self = shift;
-    local *@;
-    eval { $self->SUPER::DESTROY };
-    return;
+    delete $REAL{$self};
+    local $@;
+    eval { $self->SUPER::DESTROY; };
 }
 
 sub configure {
-    my $self = shift;
-    my $arg = shift;
-
+    my($self, $arg) = @_;
+    my $ssl_version = delete $arg->{SSL_Version} ||
+      $ENV{HTTPS_VERSION} || $DEFAULT_VERSION;
     my $ssl_debug = delete $arg->{SSL_Debug} || $ENV{HTTPS_DEBUG} || 0;
 
-    my $ctx = delete $arg->{SSL_Context} || _default_context();
+    my $ctx = delete $arg->{SSL_Context} || _default_context($ssl_version);
 
     *$self->{ssl_ctx} = $ctx;
+    *$self->{ssl_version} = $ssl_version;
     *$self->{ssl_debug} = $ssl_debug;
     *$self->{ssl_arg} = $arg;
     *$self->{ssl_peer_addr} = $arg->{PeerAddr};
     *$self->{ssl_peer_port} = $arg->{PeerPort};
+    *$self->{ssl_new_arg} = $NEW_ARGS;
     *$self->{ssl_peer_verify} = 0;
 
+    ## Crypt::SSLeay must also aware the SSL Proxy before calling
+    ## $socket->configure($args). Because the $sock->configure() will
+    ## die when failed to resolve the destination server IP address,
+    ## whether the SSL proxy is used or not!
+    ## - dqbai, 2003-05-10
     if (my $proxy = $self->proxy) {
         ($arg->{PeerAddr}, $arg->{PeerPort}) = split(':',$proxy);
-        unless ( $arg->{PeerPort} ) {
-            croak("no port given for proxy server $proxy");
-        }
+        $arg->{PeerPort} || croak("no port given for proxy server $proxy");
     }
 
     $self->SUPER::configure($arg);
 }
 
-sub timeout { shift->SUPER::timeout || 60 }
+# override to make sure there is really a timeout
+sub timeout {
+    shift->SUPER::timeout || 60;
+}
 
-sub blocking { shift->SUPER::blocking(@_) }
+sub blocking {
+    my $self = shift;
+    $self->SUPER::blocking(@_);
+}
 
 sub connect {
     my $self = shift;
@@ -80,13 +88,13 @@ sub connect {
     # configure certs on connect() time, so we can throw an undef
     # and have LWP understand the error
     eval { $self->configure_certs() };
-    if ($@) {
+    if($@) {
         $@ = "configure certs failed: $@; $!";
         $self->die_with_error($@);
     }
 
     # finished, update set_verify status
-    if (my $rv = *$self->{ssl_ctx}->set_verify()) {
+    if(my $rv = *$self->{ssl_ctx}->set_verify()) {
         *$self->{ssl_peer_verify} = $rv;
     }
 
@@ -99,8 +107,7 @@ sub connect {
         }
     }
     else {
-        *$self->{io_socket_peername} = (@_ == 1) ? $_[0]
-                                     : IO::Socket::sockaddr_in(@_);
+        *$self->{io_socket_peername}=@_ == 1 ? $_[0] : IO::Socket::sockaddr_in(@_);
         if(!$self->SUPER::connect(@_)) {
             # better to die than return here
             $@ = "Connect failed: $@; $!";
@@ -119,27 +126,45 @@ sub connect {
         $ssl->set_tlsext_host_name(*$self->{ssl_peer_addr});
 
     eval {
-        local $SIG{ALRM} = sub {
-            $self->die_with_error("SSL connect timeout")
-        };
-        _alarm_set($self->timeout);
+        local $SIG{ALRM} = sub { $self->die_with_error("SSL connect timeout") };
+        # timeout / 2 because we have 3 possible connects here
+        _alarm_set($self->timeout / 2);
 
         my $rv;
         {
             local $SIG{PIPE} = \&die;
-            $rv = eval { $ssl->connect };
+            $rv = eval { $ssl->connect; };
         }
         if (not defined $rv or $rv <= 0) {
             _alarm_set(0);
             $ssl = undef;
-            eval { $self->die_with_error("SSL negotiation failed") };
-            croak($@);
+            # See RT #59312
+            my %args = (%$arg, %$new_arg);
+            if(*$self->{ssl_version} == 23) {
+                $args{SSL_Version} = 3;
+                # the new connect might itself be overridden with a REAL SSL
+                my $new_ssl = Net::SSL->new(%args);
+                $REAL{$self} = $REAL{$new_ssl} || $new_ssl;
+                return $REAL{$self};
+            }
+            elsif(*$self->{ssl_version} == 3) {
+                # $self->die_with_error("SSL negotiation failed");
+                $args{SSL_Version} = 2;
+                my $new_ssl = Net::SSL->new(%args);
+                $REAL{$self} = $new_ssl;
+                return $new_ssl;
+            }
+			else {
+                # don't die, but do set $@, and return undef
+                eval { $self->die_with_error("SSL negotiation failed") };
+                croak($@);
+            }
         }
         _alarm_set(0);
     };
 
     # odd error in eval {} block, maybe alarm outside the evals
-    if ($@) {
+    if($@) {
         $@ = "$@; $!";
         croak($@);
     }
@@ -152,31 +177,37 @@ sub connect {
 # Delegate these calls to the Crypt::SSLeay::Conn object
 sub get_peer_certificate {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_ssl}->get_peer_certificate(@_);
 }
 
 sub get_peer_verify {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_peer_verify};
 }
 
 sub get_shared_ciphers {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_ssl}->get_shared_ciphers(@_);
 }
 
 sub get_cipher {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_ssl}->get_cipher(@_);
 }
 
 sub pending {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_ssl}->pending(@_);
 }
 
 sub ssl_context {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     *$self->{ssl_ctx};
 }
 
@@ -193,6 +224,7 @@ sub die_with_error {
 
 sub read {
     my $self = shift;
+    $self = $REAL{$self} || $self;
 
     local $SIG{__DIE__} = \&Carp::confess;
     local $SIG{ALRM} = sub { $self->die_with_error("SSL read timeout") };
@@ -207,6 +239,7 @@ sub read {
 
 sub write {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     my $n = *$self->{ssl_ssl}->write(@_);
     $self->die_with_error("write failed") if !defined $n;
     $n;
@@ -217,6 +250,7 @@ sub write {
 
 sub print {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     # should we care about $, and $\??
     # I think it is too expensive...
     $self->write(join("", @_));
@@ -224,12 +258,14 @@ sub print {
 
 sub printf {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     my $fmt = shift;
     $self->write(sprintf($fmt, @_));
 }
 
 sub getchunk {
     my $self = shift;
+    $self = $REAL{$self} || $self;
     my $buf = '';  # warnings
     my $n = $self->read($buf, 32768);
     return unless defined $n;
@@ -240,7 +276,8 @@ sub getchunk {
 # so that does not really matter.
 sub getline {
     my $self = shift;
-    my $val = "";
+    $self = $REAL{$self} || $self;
+    my $val="";
     my $buf;
     do {
         $self->SUPER::recv($buf, 1);
